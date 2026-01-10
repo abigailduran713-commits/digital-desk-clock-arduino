@@ -1,5 +1,10 @@
 # Digital Desk Clock (Arduino)
 
+## Project Demo
+![Clock Schematic](images/Clock_Schematic.jpg)
+![Clock Running](images/Clock_Running.jpg)
+![Reminder Active](images/Clock_Reminder.jpg)
+
 ## Project Overview
 This project is a standalone digital desk clock built using an Arduino Uno.  
 It features an LCD user interface, a three-button menu system, interval-based reminders, and a visual LED alert.  
