@@ -1,7 +1,7 @@
 # Digital Desk Clock (Arduino)
 
 ## Project Demo
-![Clock Schematic](images/clock_schematic.jpg)
+![Clock Schematic](images/clock_schematic2.jpg)
 ![Clock Running](images/clock_running.jpg)
 ![Reminder Active](images/clock_reminder.jpg)
 
