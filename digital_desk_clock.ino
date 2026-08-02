@@ -1,227 +1,616 @@
+#include <Wire.h>
+#include <RTClib.h>
 #include <LiquidCrystal.h>
 
-// ===== LCD: RS, E, D4, D5, D6, D7 =====
+// ======================================================
+// PIN ASSIGNMENTS
+// ======================================================
+
+// LCD: RS, E, D4, D5, D6, D7
 LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
 
-// ===== Buttons =====
-const int BTN_UP   = 2;
-const int BTN_DOWN = 3;
-const int BTN_MODE = 4;
+// Buttons connect between these pins and GND.
+const byte BTN_UP   = 2;
+const byte BTN_DOWN = 3;
+const byte BTN_MODE = 4;
 
-// ===== Reminder LED =====
-const int LED_REMINDER = 6;
+// LED: D6 -> 220-ohm resistor -> LED anode
+// LED cathode -> GND
+const byte LED_REMINDER = 6;
 
-// ===== Clock base time =====
-int baseHour = 12;
-int baseMin  = 0;
-unsigned long baseMs = 0;
+// ======================================================
+// RTC
+// ======================================================
 
-// ===== Reminder settings =====
-bool remindersOn = true;
-int intervalMin = 30;
-int lastReminderMinute = -1;
-bool showReminder = false;
-unsigned long reminderUntilMs = 0;
+RTC_DS3231 rtc;
 
-// ===== LED blinking =====
-unsigned long lastBlinkMs = 0;
-bool ledState = false;
-const unsigned long blinkIntervalMs = 500;
+// ======================================================
+// USER INTERFACE
+// ======================================================
 
-// ===== UI screens =====
 enum Screen {
-  SCR_TIME = 0,
-  SCR_STATUS,
-  SCR_SET_HOUR,
-  SCR_SET_MIN,
-  SCR_SET_INTERVAL,
-  SCR_TOGGLE_REMINDERS,
-  SCR_REMINDER
+  SCREEN_CLOCK,
+  SCREEN_STATUS,
+  SCREEN_INTERVAL,
+  SCREEN_REMINDER_TOGGLE,
+  SCREEN_SET_HOUR,
+  SCREEN_SET_MINUTE,
+  SCREEN_REMINDER
 };
-Screen screen = SCR_TIME;
 
-// ===== Button cooldown =====
-unsigned long lastActionMs = 0;
-const unsigned long actionCooldownMs = 220;
+Screen screen = SCREEN_CLOCK;
 
-// ===== Helpers =====
-void print2(int v) {
-  if (v < 10) lcd.print('0');
-  lcd.print(v);
+// ======================================================
+// REMINDER SETTINGS
+// ======================================================
+
+bool remindersEnabled = true;
+byte reminderIntervalMinutes = 30;
+
+bool reminderActive = false;
+unsigned long reminderStartedAt = 0;
+const unsigned long REMINDER_DURATION_MS = 6000;
+
+int lastTriggeredMinute = -1;
+int lastTriggeredHour = -1;
+
+// ======================================================
+// LED BLINK SETTINGS
+// ======================================================
+
+bool ledState = false;
+unsigned long lastLedChange = 0;
+const unsigned long LED_BLINK_INTERVAL_MS = 500;
+
+// ======================================================
+// BUTTON HANDLING
+// ======================================================
+
+struct Button {
+  byte pin;
+  bool stableState;
+  bool previousReading;
+  unsigned long changedAt;
+  unsigned long pressedAt;
+  bool longPressHandled;
+};
+
+Button upButton = {
+  BTN_UP, HIGH, HIGH, 0, 0, false
+};
+
+Button downButton = {
+  BTN_DOWN, HIGH, HIGH, 0, 0, false
+};
+
+Button modeButton = {
+  BTN_MODE, HIGH, HIGH, 0, 0, false
+};
+
+const unsigned long DEBOUNCE_MS = 35;
+const unsigned long LONG_PRESS_MS = 1500;
+
+// ======================================================
+// TIME-SETTING VALUES
+// ======================================================
+
+byte editHour24 = 0;
+byte editMinute = 0;
+
+// ======================================================
+// DISPLAY HELPERS
+// ======================================================
+
+const char *dayNames[] = {
+  "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+
+void clearLine(byte row) {
+  lcd.setCursor(0, row);
+  lcd.print("                ");
 }
 
-void getTime(int &hh, int &mm, int &ss) {
-  unsigned long elapsed = (millis() - baseMs) / 1000UL;
-  unsigned long total = (unsigned long)baseHour * 3600UL +
-                        (unsigned long)baseMin * 60UL +
-                        elapsed;
-  total %= 86400UL;
-  hh = total / 3600UL;
-  mm = (total % 3600UL) / 60UL;
-  ss = total % 60UL;
+void printTwoDigits(byte value) {
+  if (value < 10) {
+    lcd.print('0');
+  }
+
+  lcd.print(value);
 }
 
-bool canAct() {
-  return millis() - lastActionMs >= actionCooldownMs;
+byte convertTo12Hour(byte hour24) {
+  byte hour12 = hour24 % 12;
+
+  if (hour12 == 0) {
+    hour12 = 12;
+  }
+
+  return hour12;
 }
 
-void markAct() {
-  lastActionMs = millis();
+bool isPM(byte hour24) {
+  return hour24 >= 12;
 }
 
-void syncBaseTime(int h, int m) {
-  baseHour = (h + 24) % 24;
-  baseMin  = (m + 60) % 60;
-  baseMs = millis();
+// ======================================================
+// BUTTON FUNCTIONS
+// ======================================================
+
+void updateButton(Button &button) {
+  bool reading = digitalRead(button.pin);
+
+  if (reading != button.previousReading) {
+    button.changedAt = millis();
+    button.previousReading = reading;
+  }
+
+  if (millis() - button.changedAt >= DEBOUNCE_MS) {
+    if (reading != button.stableState) {
+      button.stableState = reading;
+
+      if (button.stableState == LOW) {
+        button.pressedAt = millis();
+        button.longPressHandled = false;
+      }
+    }
+  }
 }
+
+bool buttonWasReleased(Button &button) {
+  static bool upPreviouslyPressed = false;
+  static bool downPreviouslyPressed = false;
+  static bool modePreviouslyPressed = false;
+
+  bool *previouslyPressed = nullptr;
+
+  if (button.pin == BTN_UP) {
+    previouslyPressed = &upPreviouslyPressed;
+  } else if (button.pin == BTN_DOWN) {
+    previouslyPressed = &downPreviouslyPressed;
+  } else {
+    previouslyPressed = &modePreviouslyPressed;
+  }
+
+  if (button.stableState == LOW) {
+    *previouslyPressed = true;
+  }
+
+  if (*previouslyPressed && button.stableState == HIGH) {
+    *previouslyPressed = false;
+
+    if (!button.longPressHandled) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool buttonLongPressed(Button &button) {
+  if (
+    button.stableState == LOW &&
+    !button.longPressHandled &&
+    millis() - button.pressedAt >= LONG_PRESS_MS
+  ) {
+    button.longPressHandled = true;
+    return true;
+  }
+
+  return false;
+}
+
+// ======================================================
+// TIME SETTING
+// ======================================================
+
+void beginTimeSetting() {
+  DateTime now = rtc.now();
+
+  editHour24 = now.hour();
+  editMinute = now.minute();
+
+  screen = SCREEN_SET_HOUR;
+  lcd.clear();
+}
+
+void saveTimeToRTC() {
+  DateTime now = rtc.now();
+
+  // Preserve the current date and change only the time.
+  // Seconds reset to zero.
+  rtc.adjust(
+    DateTime(
+      now.year(),
+      now.month(),
+      now.day(),
+      editHour24,
+      editMinute,
+      0
+    )
+  );
+
+  lastTriggeredMinute = -1;
+  lastTriggeredHour = -1;
+
+  screen = SCREEN_CLOCK;
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Time saved!");
+
+  delay(800);
+  lcd.clear();
+}
+
+// ======================================================
+// REMINDER FUNCTIONS
+// ======================================================
+
+void beginReminder() {
+  reminderActive = true;
+  reminderStartedAt = millis();
+  screen = SCREEN_REMINDER;
+
+  ledState = true;
+  digitalWrite(LED_REMINDER, HIGH);
+
+  lcd.clear();
+}
+
+void endReminder() {
+  reminderActive = false;
+  ledState = false;
+  digitalWrite(LED_REMINDER, LOW);
+
+  screen = SCREEN_CLOCK;
+  lcd.clear();
+}
+
+void updateReminderLED() {
+  if (!reminderActive) {
+    ledState = false;
+    digitalWrite(LED_REMINDER, LOW);
+    return;
+  }
+
+  if (millis() - lastLedChange >= LED_BLINK_INTERVAL_MS) {
+    lastLedChange = millis();
+    ledState = !ledState;
+    digitalWrite(LED_REMINDER, ledState);
+  }
+}
+
+void checkReminder(const DateTime &now) {
+  if (!remindersEnabled || reminderActive) {
+    return;
+  }
+
+  bool correctMinute =
+    now.minute() % reminderIntervalMinutes == 0;
+
+  // Use a small time window rather than requiring the loop to
+  // execute at exactly second zero.
+  bool triggerWindow = now.second() < 3;
+
+  bool notAlreadyTriggered =
+    now.minute() != lastTriggeredMinute ||
+    now.hour() != lastTriggeredHour;
+
+  if (correctMinute && triggerWindow && notAlreadyTriggered) {
+    lastTriggeredMinute = now.minute();
+    lastTriggeredHour = now.hour();
+    beginReminder();
+  }
+}
+
+// ======================================================
+// SCREEN DRAWING
+// ======================================================
+
+void drawClockScreen(const DateTime &now) {
+  byte hour12 = convertTo12Hour(now.hour());
+
+  clearLine(0);
+  lcd.setCursor(0, 0);
+
+  lcd.print(hour12);
+  lcd.print(':');
+  printTwoDigits(now.minute());
+  lcd.print(isPM(now.hour()) ? " PM" : " AM");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+
+  lcd.print(dayNames[now.dayOfTheWeek()]);
+  lcd.print(' ');
+  printTwoDigits(now.month());
+  lcd.print('/');
+  printTwoDigits(now.day());
+  lcd.print('/');
+  lcd.print(now.year() % 100);
+}
+
+void drawStatusScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("Reminders: ");
+  lcd.print(remindersEnabled ? "ON" : "OFF");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print("Every ");
+  lcd.print(reminderIntervalMinutes);
+  lcd.print(" min");
+}
+
+void drawIntervalScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("SET INTERVAL");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print(reminderIntervalMinutes);
+  lcd.print(" min  UP/DOWN");
+}
+
+void drawReminderToggleScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("REMINDERS");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print(remindersEnabled ? "ON" : "OFF");
+  lcd.print("  UP/DOWN");
+}
+
+void drawSetHourScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("SET HOUR");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+
+  lcd.print(convertTo12Hour(editHour24));
+  lcd.print(':');
+  printTwoDigits(editMinute);
+  lcd.print(isPM(editHour24) ? " PM" : " AM");
+}
+
+void drawSetMinuteScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("SET MINUTE");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+
+  lcd.print(convertTo12Hour(editHour24));
+  lcd.print(':');
+  printTwoDigits(editMinute);
+  lcd.print(isPM(editHour24) ? " PM" : " AM");
+}
+
+void drawReminderScreen() {
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("REMINDER!");
+
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print("Hydrate MODE=OK");
+}
+
+// ======================================================
+// BUTTON ACTIONS
+// ======================================================
+
+void handleUpPress() {
+  switch (screen) {
+    case SCREEN_INTERVAL:
+      reminderIntervalMinutes += 5;
+
+      if (reminderIntervalMinutes > 120) {
+        reminderIntervalMinutes = 5;
+      }
+      break;
+
+    case SCREEN_REMINDER_TOGGLE:
+      remindersEnabled = !remindersEnabled;
+      break;
+
+    case SCREEN_SET_HOUR:
+      editHour24 = (editHour24 + 1) % 24;
+      break;
+
+    case SCREEN_SET_MINUTE:
+      editMinute = (editMinute + 1) % 60;
+      break;
+
+    case SCREEN_REMINDER:
+      // Extend the current reminder.
+      reminderStartedAt = millis();
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleDownPress() {
+  switch (screen) {
+    case SCREEN_INTERVAL:
+      if (reminderIntervalMinutes <= 5) {
+        reminderIntervalMinutes = 120;
+      } else {
+        reminderIntervalMinutes -= 5;
+      }
+      break;
+
+    case SCREEN_REMINDER_TOGGLE:
+      remindersEnabled = !remindersEnabled;
+      break;
+
+    case SCREEN_SET_HOUR:
+      editHour24 =
+        editHour24 == 0 ? 23 : editHour24 - 1;
+      break;
+
+    case SCREEN_SET_MINUTE:
+      editMinute =
+        editMinute == 0 ? 59 : editMinute - 1;
+      break;
+
+    case SCREEN_REMINDER:
+      endReminder();
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleModeShortPress() {
+  switch (screen) {
+    case SCREEN_CLOCK:
+      screen = SCREEN_STATUS;
+      break;
+
+    case SCREEN_STATUS:
+      screen = SCREEN_INTERVAL;
+      break;
+
+    case SCREEN_INTERVAL:
+      screen = SCREEN_REMINDER_TOGGLE;
+      break;
+
+    case SCREEN_REMINDER_TOGGLE:
+      screen = SCREEN_CLOCK;
+      break;
+
+    case SCREEN_SET_HOUR:
+      screen = SCREEN_SET_MINUTE;
+      break;
+
+    case SCREEN_SET_MINUTE:
+      saveTimeToRTC();
+      return;
+
+    case SCREEN_REMINDER:
+      endReminder();
+      return;
+  }
+
+  lcd.clear();
+}
+
+// ======================================================
+// SETUP
+// ======================================================
 
 void setup() {
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_MODE, INPUT_PULLUP);
+
   pinMode(LED_REMINDER, OUTPUT);
+  digitalWrite(LED_REMINDER, LOW);
 
+  Wire.begin();
   lcd.begin(16, 2);
-  baseMs = millis();
 
-  lcd.print("Digital DeskClk");
-  lcd.setCursor(0,1);
+  if (!rtc.begin()) {
+    lcd.clear();
+    lcd.print("RTC NOT FOUND");
+
+    while (true) {
+      delay(10);
+    }
+  }
+
+  lcd.clear();
+  lcd.print("Desk Clock");
+  lcd.setCursor(0, 1);
   lcd.print("Starting...");
-  delay(700);
+
+  delay(800);
   lcd.clear();
 }
 
+// ======================================================
+// MAIN LOOP
+// ======================================================
+
 void loop() {
-  bool upNow   = digitalRead(BTN_UP)   == LOW;
-  bool downNow = digitalRead(BTN_DOWN) == LOW;
-  bool modeNow = digitalRead(BTN_MODE) == LOW;
+  updateButton(upButton);
+  updateButton(downButton);
+  updateButton(modeButton);
 
-  int hh, mm, ss;
-  getTime(hh, mm, ss);
+  DateTime now = rtc.now();
 
-  // ===== Reminder trigger =====
-  if (remindersOn && screen != SCR_REMINDER) {
-    if (intervalMin > 0 && (mm % intervalMin == 0) && ss == 0) {
-      if (lastReminderMinute != mm) {
-        lastReminderMinute = mm;
-        screen = SCR_REMINDER;
-        showReminder = true;
-        reminderUntilMs = millis() + 6000;
-        lcd.clear();
-      }
-    }
+  checkReminder(now);
+  updateReminderLED();
+
+  if (
+    reminderActive &&
+    millis() - reminderStartedAt >= REMINDER_DURATION_MS
+  ) {
+    endReminder();
   }
 
-  if (screen == SCR_REMINDER && showReminder && millis() > reminderUntilMs) {
-    showReminder = false;
-    screen = SCR_TIME;
+  // Holding MODE enters the clock-setting menu.
+  if (
+    screen != SCREEN_REMINDER &&
+    buttonLongPressed(modeButton)
+  ) {
+    beginTimeSetting();
+  }
+
+  if (buttonWasReleased(upButton)) {
+    handleUpPress();
     lcd.clear();
   }
 
-  // ===== LED blinking =====
-  if (screen == SCR_REMINDER && showReminder) {
-    if (millis() - lastBlinkMs >= blinkIntervalMs) {
-      lastBlinkMs = millis();
-      ledState = !ledState;
-      digitalWrite(LED_REMINDER, ledState ? HIGH : LOW);
-    }
-  } else {
-    digitalWrite(LED_REMINDER, LOW);
-    ledState = false;
+  if (buttonWasReleased(downButton)) {
+    handleDownPress();
+    lcd.clear();
   }
 
-  // ===== Button actions =====
-  if (canAct()) {
-    if (modeNow) {
-      if      (screen == SCR_TIME) screen = SCR_STATUS;
-      else if (screen == SCR_STATUS) screen = SCR_SET_HOUR;
-      else if (screen == SCR_SET_HOUR) screen = SCR_SET_MIN;
-      else if (screen == SCR_SET_MIN) screen = SCR_SET_INTERVAL;
-      else if (screen == SCR_SET_INTERVAL) screen = SCR_TOGGLE_REMINDERS;
-      else if (screen == SCR_TOGGLE_REMINDERS) screen = SCR_TIME;
-      else if (screen == SCR_REMINDER) {
-        showReminder = false;
-        screen = SCR_TIME;
-      }
-      lcd.clear();
-      markAct();
-    }
-
-    if (screen == SCR_SET_HOUR) {
-      if (upNow)   { syncBaseTime(baseHour + 1, baseMin); lcd.clear(); markAct(); }
-      if (downNow) { syncBaseTime(baseHour - 1, baseMin); lcd.clear(); markAct(); }
-    }
-    else if (screen == SCR_SET_MIN) {
-      if (upNow)   { syncBaseTime(baseHour, baseMin + 1); lcd.clear(); markAct(); }
-      if (downNow) { syncBaseTime(baseHour, baseMin - 1); lcd.clear(); markAct(); }
-    }
-    else if (screen == SCR_SET_INTERVAL) {
-      if (upNow)   { intervalMin = intervalMin >= 120 ? 5 : intervalMin + 5; lcd.clear(); markAct(); }
-      if (downNow) { intervalMin = intervalMin <= 5 ? 120 : intervalMin - 5; lcd.clear(); markAct(); }
-    }
-    else if (screen == SCR_TOGGLE_REMINDERS) {
-      if (upNow || downNow) { remindersOn = !remindersOn; lcd.clear(); markAct(); }
-    }
-    else if (screen == SCR_REMINDER) {
-      if (upNow)   { reminderUntilMs = millis() + 6000; markAct(); }
-      if (downNow) { showReminder = false; screen = SCR_TIME; lcd.clear(); markAct(); }
-    }
+  if (buttonWasReleased(modeButton)) {
+    handleModeShortPress();
   }
 
-  // ===== Display =====
-  if (screen == SCR_TIME) {
-    lcd.setCursor(0,0);
-    lcd.print("Time ");
-    print2(hh); lcd.print(":"); print2(mm); lcd.print(":"); print2(ss);
-    lcd.print("   ");
-    lcd.setCursor(0,1);
-    lcd.print("MODE:Menu ");
-    lcd.print(remindersOn ? "ON " : "OFF");
-  }
-  else if (screen == SCR_STATUS) {
-    lcd.setCursor(0,0);
-    lcd.print("Reminders: ");
-    lcd.print(remindersOn ? "ON " : "OFF");
-    lcd.setCursor(0,1);
-    lcd.print("Every ");
-    lcd.print(intervalMin);
-    lcd.print(" min     ");
-  }
-  else if (screen == SCR_SET_HOUR) {
-    lcd.setCursor(0,0);
-    lcd.print("SET HOUR");
-    lcd.setCursor(0,1);
-    lcd.print("Hour: ");
-    print2(baseHour);
-  }
-  else if (screen == SCR_SET_MIN) {
-    lcd.setCursor(0,0);
-    lcd.print("SET MIN");
-    lcd.setCursor(0,1);
-    lcd.print("Min: ");
-    print2(baseMin);
-  }
-  else if (screen == SCR_SET_INTERVAL) {
-    lcd.setCursor(0,0);
-    lcd.print("SET INTERVAL");
-    lcd.setCursor(0,1);
-    lcd.print("Every ");
-    lcd.print(intervalMin);
-    lcd.print(" min");
-  }
-  else if (screen == SCR_TOGGLE_REMINDERS) {
-    lcd.setCursor(0,0);
-    lcd.print("REMINDERS");
-    lcd.setCursor(0,1);
-    lcd.print(remindersOn ? "ON " : "OFF");
-    lcd.print(" UP/DN");
-  }
-  else if (screen == SCR_REMINDER) {
-    lcd.setCursor(0,0);
-    lcd.print("REMINDER!");
-    lcd.setCursor(0,1);
-    lcd.print("Hydrate  MODE");
+  switch (screen) {
+    case SCREEN_CLOCK:
+      drawClockScreen(now);
+      break;
+
+    case SCREEN_STATUS:
+      drawStatusScreen();
+      break;
+
+    case SCREEN_INTERVAL:
+      drawIntervalScreen();
+      break;
+
+    case SCREEN_REMINDER_TOGGLE:
+      drawReminderToggleScreen();
+      break;
+
+    case SCREEN_SET_HOUR:
+      drawSetHourScreen();
+      break;
+
+    case SCREEN_SET_MINUTE:
+      drawSetMinuteScreen();
+      break;
+
+    case SCREEN_REMINDER:
+      drawReminderScreen();
+      break;
   }
 
-  delay(40);
+  delay(10);
 }
