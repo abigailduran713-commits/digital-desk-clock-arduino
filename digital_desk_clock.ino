@@ -400,7 +400,7 @@ void drawReminderScreen() {
 
   clearLine(1);
   lcd.setCursor(0, 1);
-  lcd.print("Hydrate MODE=OK");
+  lcd.print("MODE=OK");
 }
 
 // ======================================================
