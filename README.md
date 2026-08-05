@@ -18,7 +18,9 @@ After testing the circuit on a breadboard, the complete system was converted int
 - Blinking LED alert during active reminders
 - Custom PCB designed in KiCad
 
-## Hardware Used for Prototype
+## Hardware Used 
+
+### Breadboard Prototype
 - Arduino Uno R3
 - 16x2 LCD display
 - DS3231 Real-time clock module
@@ -27,7 +29,7 @@ After testing the circuit on a breadboard, the complete system was converted int
 - Potentiometer (LCD contrast)
 - Breadboard and jumper wires
 
-## Hardware Used for PCB
+### PCB Version
 - Custom PCB designed in KiCad
 - Arduino Uno R3 and headers
 - RTC module and headers
@@ -47,15 +49,6 @@ The circuit was initially developed and tested on a breadboard. After confirming
 
 ## PCB Design
 After completing the breadboard prototype, the circuit was recreated as a schematic in KiCad and converted into a custom PCB layout.
-
-The PCB design includes connections for:
-- The Arduino
-- RTC module
-- LCD
-- 3 Buttons
-- LED
-- Potentiometer
-- Resistors
 
 The design process included:
 - Assignming schematic symbols and footprints
