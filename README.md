@@ -1,4 +1,4 @@
-# Digital Desk Clock (Arduino)
+# Arduino Digital Desk Clock
 
 ## Project Overview
 This project is a standalone digital desk clock built using an Arduino Uno, a DS3231 real-time clock module, and a 16x2 LCD.
